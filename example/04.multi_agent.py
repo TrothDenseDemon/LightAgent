@@ -1,5 +1,6 @@
 """示例：多代理协作与会话管理"""
 
+import asyncio
 import os
 from pprint import pprint
 
@@ -139,3 +140,15 @@ graph_results = light_swarm.run_task_graph(tasks, session=session)
 
 print("\n=== 任务图结果 ===")
 pprint(graph_results)
+async def main() -> None:
+    res = await light_swarm.arun(
+        agent=agent_a,
+        query="Hello, I am Alice. I need to check if Wang Xiaoming has completed onboarding.",
+        stream=False,
+    )
+    print(res)
+
+
+if __name__ == "__main__":
+    # LightSwarm 也支持异步调用，通过 asyncio.run 启动。
+    asyncio.run(main())
