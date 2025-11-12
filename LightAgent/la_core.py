@@ -605,13 +605,28 @@ class LightAgent:
             if isinstance(tool, str):
                 try:
                     tool_func = self.tool_loader.load_tool(tool)
-                    self.tool_registry.register_tool(tool_func)
-                    self.log("DEBUG", "load_tools", {"tool": tool, "status": "success"})
+                    registered = self.tool_registry.register_tool(tool_func)
+                    if registered and hasattr(tool_func, "tool_info"):
+                        tool_name = tool_func.tool_info.get("tool_name", tool)
+                        self.loaded_tools[tool_name] = tool_func
+                        self.tool_loader.loaded_tools[tool_name] = tool_func
+                        self.log("DEBUG", "load_tools", {"tool": tool_name, "status": "success"})
+                    else:
+                        self.log("ERROR", "register_tool", {
+                            "tool": tool,
+                            "status": "failed",
+                            "reason": "missing tool_info"
+                        })
                 except Exception as e:
                     self.log("ERROR", "load_tools", {"tool": tool, "error": str(e)})
             elif callable(tool) and hasattr(tool, "tool_info"):
+                tool_name = tool.tool_info.get("tool_name", tool.__name__)
                 if self.tool_registry.register_tool(tool):
-                    self.log("DEBUG", "register_tool", {"tool": tool.__name__, "status": "success"})
+                    self.loaded_tools[tool_name] = tool
+                    self.tool_loader.loaded_tools[tool_name] = tool
+                    self.log("DEBUG", "register_tool", {"tool": tool_name, "status": "success"})
+                else:
+                    self.log("ERROR", "register_tool", {"tool": tool_name, "status": "failed"})
 
     async def setup_mcp(
             self,
