@@ -17,6 +17,7 @@ import os
 import random
 import re
 import traceback
+import textwrap
 from contextlib import AsyncExitStack
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -1361,92 +1362,92 @@ class LightAgent:
             raise  # 重新抛出异常以便调试
 
     def create_tool(self, user_input: str, tools_directory: str = "tools"):
-        """
-        根据用户输入的文本生成 Python 代码，并将其保存为工具
-        """
-        # 调用大模型生成 Python 代码
-        system_prompt = """
-        The user will provide some exam text. Please parse the "tool_name" and "code" and output them in JSON format. 
+        """根据用户输入的自然语言描述生成 Python 工具代码。"""
 
-        EXAMPLE INPUT: 
-        请根据文档生成一个天气调用的工具，API介绍如下
+        system_prompt = textwrap.dedent(
+            """
+            The user will provide some exam text. Please parse the "tool_name" and "code" and output them in JSON format.
 
-        EXAMPLE JSON OUTPUT:
-        {'tools': [{
-            "tool_name": "get_weather",
-            "tool_code": "import requests
-            def get_weather(
-        city_name: str
-) -> str:
-    /"/"/"
-    Get the current weather for `city_name`
-    /"/"/"
-    if not isinstance(city_name, str):
-        raise TypeError("City name must be a string")
+            EXAMPLE INPUT:
+            请根据文档生成一个天气调用的工具，API介绍如下
 
-    key_selection = {
-        "current_condition": ["temp_C", "FeelsLikeC", "humidity", "weatherDesc", "observation_time"],
-    }
-    try:
-        resp = requests.get(f"https://wttr.in/{city_name}?format=j1")
-        resp.raise_for_status()
-        resp = resp.json()
-        ret = {k: {_v: resp[k][0][_v] for _v in v} for k, v in key_selection.items()}
-    except:
-        import traceback
-        ret = "Error encountered while fetching weather data!\n" + traceback.format_exc()
+            EXAMPLE JSON OUTPUT:
+            {
+                "tools": [
+                    {
+                        "tool_name": "get_weather",
+                        "tool_code": "import requests\n"
+                                      "def get_weather(city_name: str) -> str:\n"
+                                      "    'Get the current weather for city_name'\n"
+                                      "    if not isinstance(city_name, str):\n"
+                                      "        raise TypeError('City name must be a string')\n\n"
+                                      "    key_selection = {\n"
+                                      "        'current_condition': ['temp_C', 'FeelsLikeC', 'humidity', 'weatherDesc', 'observation_time'],\n"
+                                      "    }\n"
+                                      "    try:\n"
+                                      "        resp = requests.get(f'https://wttr.in/{city_name}?format=j1')\n"
+                                      "        resp.raise_for_status()\n"
+                                      "        resp = resp.json()\n"
+                                      "        ret = {k: {_v: resp[k][0][_v] for _v in v} for k, v in key_selection.items()}\n"
+                                      "    except Exception:\n"
+                                      "        import traceback\n"
+                                      "        ret = 'Error encountered while fetching weather data!\\n' + traceback.format_exc()\n\n"
+                                      "    return str(ret)\n\n"
+                                      "get_weather.tool_info = {\n"
+                                      "    'tool_name': 'get_weather',\n"
+                                      "    'tool_title': '天气查询',\n"
+                                      "    'tool_description': '获取指定城市的当前天气信息',\n"
+                                      "    'tool_params': [\n"
+                                      "        {'name': 'city_name', 'description': '要查询的城市名称', 'type': 'string', 'required': True},\n"
+                                      "    ]\n"
+                                      "}\n"
+                    }
+                ]
+            }
+            """
+        ).strip()
 
-    return str(ret)
-
-# 在函数内部定义工具信息
-get_weather.tool_info = {
-    "tool_name": "get_weather",
-    "tool_title": "天气查询",
-    "tool_description": "获取指定城市的当前天气信息",
-    "tool_params": [
-        {"name": "city_name", "description": "要查询的城市名称", "type": "string", "required": True},
-    ]
-}"
-        }]}
-        """
         params = {
             "model": self.model,
             "messages": [
                 {"role": "system", "content": "You are a helpful assistant that generates Python code in JSON format."},
-                {"role": "user", "content": f"Generate Python tools based on the following description. "
-                                            f"Return a JSON array where each item contains 'tool_name' and 'tool_code'. "
-                                            f"\n {system_prompt} "
-                                            f"Description:\n{user_input}"},
+                {
+                    "role": "user",
+                    "content": (
+                        "Generate Python tools based on the following description. "
+                        "Return a JSON array where each item contains 'tool_name' and 'tool_code'.\n"
+                        f"System Guide:\n{system_prompt}\n"
+                        f"Description:\n{user_input}"
+                    ),
+                },
             ],
             "response_format": {"type": "json_object"},
         }
+
         try:
             response = self.client.chat.completions.create(**params)
             response_data = json.loads(response.choices[0].message.content)
+        except Exception as exc:
+            self.log("ERROR", "tool_creation_failed", {"error": str(exc)})
+            raise
 
-            # 确保返回的数据是 JSON 对象
-            if not isinstance(response_data, dict):
-                raise ValueError("Response is not a JSON object.")
+        if not isinstance(response_data, dict):
+            raise ValueError("Response is not a JSON object.")
 
-            # 遍历每个工具
-            for tool_data in response_data["tools"]:
-                tool_name = tool_data.get("tool_name")
-                tool_code = tool_data.get("tool_code")
+        tools = response_data.get("tools") or []
+        for tool_data in tools:
+            tool_name = tool_data.get("tool_name")
+            tool_code = tool_data.get("tool_code")
+            if not tool_name or not tool_code:
+                self.log("ERROR", "invalid_tool_data", {"tool_data": tool_data})
+                continue
 
-                if not tool_name or not tool_code:
-                    self.log("ERROR", "invalid_tool_data", {"tool_data": tool_data})
-                    continue
+            tool_path = os.path.join(tools_directory, f"{tool_name}.py")
+            with open(tool_path, "w", encoding="utf-8") as file:
+                file.write(tool_code)
 
-                # 保存生成的代码到 tools 目录
-                tool_path = os.path.join(tools_directory, f"{tool_name}.py")
-                with open(tool_path, "w", encoding="utf-8") as f:
-                    f.write(tool_code)
-                self.log("INFO", "tool_created", {"tool_name": tool_name, "tool_path": tool_path})
-
-                # 自动加载新创建的工具
-                self.load_tools([tool_name], tools_directory)
-        except Exception as e:
-            self.log("ERROR", "tool_creation_failed", {"error": str(e)})
+            self.log("INFO", "tool_created", {"tool_name": tool_name, "tool_path": tool_path})
+            self.load_tools([tool_name], tools_directory)
 
 
 @dataclass
