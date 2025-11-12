@@ -1,5 +1,6 @@
 import asyncio
 import json
+
 from LightAgent import LightAgent
 
 # Initialize Agent
@@ -16,10 +17,15 @@ def read_mcp_settings():
     return mcp_settings_json
 
 
-# 接入MCP 服务
-mcp_settings = read_mcp_settings()
-asyncio.run(agent.setup_mcp(mcp_setting=mcp_settings))
+async def main() -> None:
+    # 接入MCP 服务
+    mcp_settings = read_mcp_settings()
+    await agent.setup_mcp(mcp_setting=mcp_settings)
 
-# Run Agent
-response = agent.run("Please search the weather in Shanghai.", stream=False)
-print(response)
+    # Run Agent
+    response = await agent.arun("Please search the weather in Shanghai.", stream=False)
+    print(response)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

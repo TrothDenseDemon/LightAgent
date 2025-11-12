@@ -1,3 +1,4 @@
+import asyncio
 import os
 from loguru import logger
 from LightAgent import LightAgent, LightSwarm
@@ -15,15 +16,19 @@ agent = LightAgent(
     )
 
 
-# 模拟历史对话
-history = [
-    {"role": "user", "content": "今天天气怎么样？"},
-    {"role": "assistant", "content": "今天天气晴朗，温度在25度左右。"},
-]
+async def main() -> None:
+    # 模拟历史对话
+    history = [
+        {"role": "user", "content": "今天天气怎么样？"},
+        {"role": "assistant", "content": "今天天气晴朗，温度在25度左右。"},
+    ]
+
+    user_id = "test_user_2"
+    query = "你好，请总结上面的信息"
+    response_stream = await agent.arun(query, history=history, stream=True, user_id=user_id)
+    async for chunk in response_stream:
+        print(chunk, end="\n", flush=True)
 
 
-user_id = "test_user_2"
-query = "你好，请总结上面的信息"
-response = agent.run(query, history=history, stream=True, user_id=user_id)  # 使用 agent 运行查询
-for chunk in response:
-    print(chunk, end="\n", flush=True)
+if __name__ == "__main__":
+    asyncio.run(main())

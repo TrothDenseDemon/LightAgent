@@ -1,3 +1,4 @@
+import asyncio
 import os
 import time
 
@@ -50,8 +51,13 @@ agent = LightAgent(model="gpt-4.1-mini", api_key="<your_api_key>",
                    log_level="debug",
                    log_file="example.log")
 
-# Run Agent
-response = agent.run("Please search the weather in Shanghai.", stream=True)
-full_response = ''
-for chunk in response:
-    print(chunk, end="\n", flush=True)
+async def main() -> None:
+    response_stream = await agent.arun("Please search the weather in Shanghai.", stream=True)
+    full_response = ''
+    async for chunk in response_stream:
+        print(chunk, end="\n", flush=True)
+        full_response += str(chunk)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

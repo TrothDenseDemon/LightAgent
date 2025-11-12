@@ -1,3 +1,4 @@
+import asyncio
 import os
 
 from LightAgent import LightAgent, LightSwarm
@@ -35,6 +36,15 @@ agent_d = LightAgent(
 # Automatically register agents to the LightSwarm instance
 light_swarm.register_agent(agent_a, agent_b, agent_c, agent_d)
 
-# Run Agent A
-res = light_swarm.run(agent=agent_a, query="Hello, I am Alice. I need to check if Wang Xiaoming has completed onboarding.", stream=False)
-print(res)
+async def main() -> None:
+    res = await light_swarm.arun(
+        agent=agent_a,
+        query="Hello, I am Alice. I need to check if Wang Xiaoming has completed onboarding.",
+        stream=False,
+    )
+    print(res)
+
+
+if __name__ == "__main__":
+    # LightSwarm 也支持异步调用，通过 asyncio.run 启动。
+    asyncio.run(main())

@@ -1,4 +1,6 @@
+import asyncio
 import os
+
 from loguru import logger
 from LightAgent import LightAgent, LightSwarm
 
@@ -54,28 +56,34 @@ agent = LightAgent(
         log_file="example.log"
     )
 
-def run_conversation(query: str, stream=False, max_retry=5, user_id="user1"):
+
+async def run_conversation(query: str, stream: bool = False, max_retry: int = 5, user_id: str = "user1") -> str:
     logger.info(f"\n开始思考问题: {query}")
-    response = agent.run(query, stream=stream, max_retry=max_retry, user_id=user_id)  # 使用 agent 运行查询
-    # 处理响应
     if stream:
-        for chunk in response:
+        response_stream = await agent.arun(query, stream=True, max_retry=max_retry, user_id=user_id)
+        async for chunk in response_stream:
             print(chunk, end="\n", flush=True)
-            # content = chunk.choices[0].delta.content or ""
-            # print(content, end="", flush=True)
-    else:
-        logger.info(f"Final Reply: \n{response}")
+        return ""
+    response = await agent.arun(query, stream=False, max_retry=max_retry, user_id=user_id)
+    logger.info(f"Final Reply: \n{response}")
     return response
 
-# agent自我学习的测试1
-logger.info("\n=========== next conversation ===========")
-user_id = "test_user_1"
-query = "我现在有一个采购货款需要转账，我的审批流程是怎么样的？"
-run_conversation(query, stream=True, user_id=user_id)
-logger.info("\n=========== next conversation ===========")
-query = "请记住：本公司新规定，2025年1月起，公司所有采购货款的转账需要先找负责采购的丁总签字，再交给财务经历审批，财务经历审批后，还需要公司总经理审批，出纳才能打款转过去。"
-run_conversation(query, stream=True, user_id=user_id)
 
-user_id = "test_user_2"
-query = "你好，我有一笔采购款要转给对方，我要怎么申请转账？"
-run_conversation(query, stream=True, user_id=user_id)
+async def main() -> None:
+    # agent自我学习的测试1
+    logger.info("\n=========== next conversation ===========")
+    user_id = "test_user_1"
+    query = "我现在有一个采购货款需要转账，我的审批流程是怎么样的？"
+    await run_conversation(query, stream=True, user_id=user_id)
+    logger.info("\n=========== next conversation ===========")
+    query = "请记住：本公司新规定，2025年1月起，公司所有采购货款的转账需要先找负责采购的丁总签字，再交给财务经历审批，财务经历审批后，还需要公司总经理审批，出纳才能打款转过去。"
+    await run_conversation(query, stream=True, user_id=user_id)
+
+    user_id = "test_user_2"
+    query = "你好，我有一笔采购款要转给对方，我要怎么申请转账？"
+    await run_conversation(query, stream=True, user_id=user_id)
+
+
+if __name__ == "__main__":
+    # 通过 asyncio.run 启动示例，在同步脚本中同样适用。
+    asyncio.run(main())

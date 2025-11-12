@@ -1,15 +1,14 @@
+import asyncio
+
 from LightAgent import LightAgent
 
 
 # Define Tool
 def get_weather(city_name: str) -> str:
-    """
-    Get the current weather for `city_name`
-    """
+    """Get the current weather for `city_name`."""
     return f"Query result: {city_name} is sunny."
 
 
-# Define tool information inside the function
 get_weather.tool_info = {
     "tool_name": "get_weather",
     "tool_description": "Get current weather information for the specified city.",
@@ -20,10 +19,18 @@ get_weather.tool_info = {
 
 tools = [get_weather]
 
-# Initialize Agent
-agent = LightAgent(model="qwen-turbo-2024-11-01", api_key="your_api_key", base_url="http://your_base_url/v1",
-                   tools=tools)
 
-# Run Agent
-response = agent.run("Please check the weather in Shanghai.")
-print(response)
+async def main() -> None:
+    agent = LightAgent(
+        model="qwen-turbo-2024-11-01",
+        api_key="your_api_key",
+        base_url="http://your_base_url/v1",
+        tools=tools,
+    )
+    response = await agent.arun("Please check the weather in Shanghai.")
+    print(response)
+
+
+if __name__ == "__main__":
+    # 使用 asyncio.run 保持与同步脚本的兼容性。
+    asyncio.run(main())
