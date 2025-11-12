@@ -19,6 +19,7 @@ import re
 import traceback
 from contextlib import AsyncExitStack
 from copy import deepcopy
+from dataclasses import dataclass, field
 from datetime import datetime
 from functools import partial
 from typing import List, Dict, Any, Callable, Union, Optional, Generator, AsyncGenerator, Protocol
@@ -1448,36 +1449,380 @@ get_weather.tool_info = {
             self.log("ERROR", "tool_creation_failed", {"error": str(e)})
 
 
+@dataclass
+class SwarmSession:
+    session_id: str
+    participants: List[str]
+    max_rounds: int = 10
+    history: List[Dict[str, Any]] = field(default_factory=list)
+    routing_strategy: Union[str, Callable[["SwarmSession", Optional[Dict[str, Any]]], Optional[str]]] = "round_robin"
+    routing_rules: Dict[str, Any] = field(default_factory=dict)
+    termination_condition: Optional[Callable[["SwarmSession", "LightSwarm"], bool]] = None
+    shared_state: Dict[str, Any] = field(default_factory=dict)
+    prompt_builder: Optional[Callable[[str, Optional[Dict[str, Any]], "SwarmSession"], str]] = None
+    round_index: int = 0
+    last_speaker: Optional[str] = None
+    auto_stop_tokens: List[str] = field(default_factory=lambda: ["[DONE]", "<FINAL>"])
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
 class LightSwarm:
     def __init__(self):
         self.agents: Dict[str, LightAgent] = {}
+        self.sessions: Dict[str, SwarmSession] = {}
 
     def register_agent(self, *agents: LightAgent):
-        """
-        注册一个或多个代理。
-
-        :param agents: 要注册的代理实例，支持多个代理。
-        """
+        """注册一个或多个代理。"""
         for agent in agents:
             if agent.name in self.agents:
-                # print(f"Agent '{agent.name}' is already registered.")
                 agent.log("INFO", "register_agent", {"agent_name": agent.name, "status": "already_registered"})
             else:
                 self.agents[agent.name] = agent
-                # print(f"Agent '{agent.name}' registered.")
                 agent.log("INFO", "register_agent", {"agent_name": agent.name, "status": "registered"})
 
-    def run(self, agent: LightAgent, query: str, stream=False):
-        """
-        运行指定代理。
+    def _ensure_agent(self, agent: Union[str, LightAgent]) -> LightAgent:
+        if isinstance(agent, LightAgent):
+            if agent.name not in self.agents:
+                self.register_agent(agent)
+            return agent
+        if agent not in self.agents:
+            raise ValueError(f"Agent '{agent}' not found.")
+        return self.agents[agent]
 
-        :param agent_name: 代理名称。
-        :param query: 用户输入。
-        :return: 代理的回复。
-        """
+    def create_session(
+            self,
+            *,
+            participants: List[Union[str, LightAgent]],
+            session_id: Optional[str] = None,
+            max_rounds: int = 10,
+            history: Optional[List[Dict[str, Any]]] = None,
+            routing_strategy: Union[str, Callable[[SwarmSession, Optional[Dict[str, Any]]], Optional[str]]] = "round_robin",
+            routing_rules: Optional[Dict[str, Any]] = None,
+            termination_condition: Optional[Callable[[SwarmSession, "LightSwarm"], bool]] = None,
+            shared_state: Optional[Dict[str, Any]] = None,
+            prompt_builder: Optional[Callable[[str, Optional[Dict[str, Any]], SwarmSession], str]] = None,
+            auto_stop_tokens: Optional[List[str]] = None,
+            metadata: Optional[Dict[str, Any]] = None,
+    ) -> SwarmSession:
+        """创建一个新的群聊会话。"""
+
+        if not participants:
+            raise ValueError("participants must not be empty")
+
+        participant_names: List[str] = []
+        for item in participants:
+            resolved = self._ensure_agent(item)
+            participant_names.append(resolved.name)
+
+        session_id = session_id or uuid4().hex
+        routing_rules = routing_rules or {}
+        shared_state = deepcopy(shared_state) if shared_state else {}
+        metadata = deepcopy(metadata) if metadata else {}
+
+        normalised_history: List[Dict[str, Any]] = []
+        for message in history or []:
+            normalised_history.append(self._normalise_message(message))
+
+        session = SwarmSession(
+            session_id=session_id,
+            participants=participant_names,
+            max_rounds=max_rounds,
+            history=normalised_history,
+            routing_strategy=routing_strategy,
+            routing_rules=routing_rules,
+            termination_condition=termination_condition,
+            shared_state=shared_state,
+            prompt_builder=prompt_builder,
+            metadata=metadata,
+        )
+
+        if auto_stop_tokens is not None:
+            session.auto_stop_tokens = list(auto_stop_tokens)
+
+        self.sessions[session_id] = session
+        return session
+
+    def get_session(self, session_id: str) -> SwarmSession:
+        if session_id not in self.sessions:
+            raise KeyError(f"Session '{session_id}' not found")
+        return self.sessions[session_id]
+
+    def end_session(self, session_id: str) -> None:
+        if session_id in self.sessions:
+            del self.sessions[session_id]
+
+    def update_shared_state(self, session_id: str, **kwargs) -> None:
+        session = self.get_session(session_id)
+        session.shared_state.update(kwargs)
+
+    def run(self, agent: LightAgent, query: str, stream: bool = False):
         if agent.name not in self.agents:
             raise ValueError(f"Agent '{agent.name}' not found.")
         return agent.run(query, light_swarm=self, stream=stream)
+
+    def run_group_chat(
+            self,
+            *,
+            session: Union[str, SwarmSession],
+            initial_prompt: Optional[str] = None,
+            user_name: str = "user",
+            stream: bool = False,
+            metadata: Optional[Dict[str, Any]] = None,
+    ) -> SwarmSession:
+        """按照会话策略轮流调用代理。"""
+
+        if isinstance(session, str):
+            session_state = self.get_session(session)
+        else:
+            session_state = session
+        run_metadata = deepcopy(metadata) if metadata else {}
+
+        if initial_prompt:
+            session_state.history.append(
+                self._normalise_message({
+                    "role": "user",
+                    "name": user_name,
+                    "content": initial_prompt,
+                })
+            )
+
+        while session_state.round_index < session_state.max_rounds:
+            if session_state.termination_condition and session_state.termination_condition(session_state, self):
+                break
+
+            next_agent_name = self._select_next_agent(session_state)
+            if not next_agent_name:
+                break
+
+            agent = self._ensure_agent(next_agent_name)
+            last_message = session_state.history[-1] if session_state.history else None
+            query = self._build_agent_prompt(agent.name, last_message, session_state)
+            history_payload = self._format_history_for_agent(session_state.history)
+            merged_metadata = deepcopy(session_state.shared_state)
+            merged_metadata.update(run_metadata)
+            merged_metadata.update(session_state.metadata)
+            merged_metadata = merged_metadata or None
+
+            response = agent.run(
+                query=query,
+                light_swarm=self,
+                stream=stream,
+                history=history_payload,
+                metadata=merged_metadata,
+            )
+
+            if stream:
+                response_text, _ = self._consume_stream(response)
+            else:
+                response_text = response
+
+            confidence = self._extract_confidence(response_text) if isinstance(response_text, str) else None
+            message_entry = {
+                "role": "assistant",
+                "name": agent.name,
+                "content": response_text,
+            }
+            if confidence is not None:
+                message_entry["metadata"] = {"confidence": confidence}
+
+            session_state.history.append(message_entry)
+            session_state.last_speaker = agent.name
+            session_state.round_index += 1
+
+            if self._should_stop(session_state, response_text):
+                break
+
+        return session_state
+
+    def run_task_graph(
+            self,
+            tasks: List[Dict[str, Any]],
+            *,
+            session: Optional[Union[str, SwarmSession]] = None,
+            shared_prompt: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """执行简单的任务图，任务之间可共享上下文。"""
+
+        if session is None:
+            participants = [self._ensure_agent(task["agent"]).name for task in tasks]
+            session_state = self.create_session(participants=list(dict.fromkeys(participants)))
+        else:
+            session_state = self.get_session(session) if isinstance(session, str) else session
+
+        if shared_prompt:
+            session_state.history.append(self._normalise_message({
+                "role": "user",
+                "name": "task", 
+                "content": shared_prompt,
+            }))
+
+        pending = list(tasks)
+        results: Dict[str, Any] = {}
+
+        while pending:
+            progressed = False
+            for task in list(pending):
+                task_id = task.get("id") or uuid4().hex
+                depends = task.get("depends_on", [])
+                if any(dep not in results for dep in depends):
+                    continue
+
+                agent = self._ensure_agent(task["agent"])
+                prompt = task.get("prompt") or task.get("input") or ""
+                if callable(prompt):
+                    query = prompt(results, session_state.shared_state)
+                else:
+                    query = str(prompt)
+
+                history_payload = self._format_history_for_agent(session_state.history)
+                metadata = deepcopy(session_state.shared_state)
+                metadata.update(task.get("metadata", {}))
+                response = agent.run(query=query, light_swarm=self, history=history_payload, metadata=metadata or None)
+
+                message_entry = {
+                    "role": "assistant",
+                    "name": agent.name,
+                    "content": response,
+                    "metadata": {"task_id": task_id, "depends_on": depends},
+                }
+                session_state.history.append(message_entry)
+                session_state.last_speaker = agent.name
+                session_state.round_index += 1
+                results[task_id] = response
+                pending.remove(task)
+                progressed = True
+            if not progressed:
+                raise RuntimeError("Cannot resolve task graph; check for circular dependencies or missing prerequisites.")
+
+        return results
+
+    def _format_history_for_agent(self, history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        formatted = []
+        for message in history:
+            entry = {
+                "role": message.get("role", "assistant"),
+                "content": message.get("content", ""),
+            }
+            if message.get("name"):
+                entry["name"] = message["name"]
+            formatted.append(entry)
+        return formatted
+
+    def _build_agent_prompt(
+            self,
+            agent_name: str,
+            last_message: Optional[Dict[str, Any]],
+            session: SwarmSession,
+    ) -> str:
+        if session.prompt_builder:
+            return session.prompt_builder(agent_name, last_message, session)
+
+        base_task = session.shared_state.get("task") or session.shared_state.get("goal") or ""
+        sections = []
+        if base_task:
+            sections.append(str(base_task))
+        if last_message:
+            speaker = last_message.get("name") or last_message.get("role") or "previous speaker"
+            sections.append(f"最新消息来自 {speaker}:\n{last_message.get('content', '')}")
+        sections.append("请结合共享上下文，给出你的下一步回复或行动建议。")
+        return "\n\n".join(filter(None, sections))
+
+    def _select_next_agent(self, session: SwarmSession) -> Optional[str]:
+        strategy = session.routing_strategy
+        last_message = session.history[-1] if session.history else None
+
+        if callable(strategy):
+            return strategy(session, last_message)
+
+        if strategy == "round_robin":
+            index = session.round_index % len(session.participants)
+            return session.participants[index]
+
+        if strategy == "role":
+            transitions = session.routing_rules.get("role_transitions", {})
+            if last_message and last_message.get("name") in self.agents:
+                last_role = self.agents[last_message["name"]].role
+                if last_role and last_role in transitions:
+                    return transitions[last_role]
+            return session.routing_rules.get("fallback") or session.participants[0]
+
+        if strategy == "confidence":
+            confidence = None
+            if last_message:
+                metadata = last_message.get("metadata") or {}
+                confidence = metadata.get("confidence")
+                if confidence is None:
+                    confidence = self._extract_confidence(last_message.get("content", ""))
+
+            thresholds = session.routing_rules.get("thresholds", [])
+            for rule in thresholds:
+                target_agent = rule.get("agent")
+                threshold_value = rule.get("value", 0)
+                operator = rule.get("op", "gte").lower()
+                if confidence is None or not target_agent:
+                    continue
+                if operator == "gte" and confidence >= threshold_value:
+                    return target_agent
+                if operator == "lte" and confidence <= threshold_value:
+                    return target_agent
+
+            return session.routing_rules.get("fallback") or session.participants[0]
+
+        return session.participants[0]
+
+    def _extract_confidence(self, content: str) -> Optional[float]:
+        if not content:
+            return None
+        match = re.search(r"(confidence|信心)\s*[:：]\s*(0?\.\d+|1(?:\.0+)?)", content, re.IGNORECASE)
+        if match:
+            try:
+                return float(match.group(2))
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def _should_stop(self, session: SwarmSession, response_text: Any) -> bool:
+        if session.termination_condition and session.termination_condition(session, self):
+            return True
+        if isinstance(response_text, str):
+            for token in session.auto_stop_tokens:
+                if token and token in response_text:
+                    return True
+        if session.shared_state.get("stop"):
+            return True
+        return False
+
+    def _consume_stream(self, response: Generator) -> tuple[str, List[Any]]:
+        collected_chunks: List[Any] = []
+        texts: List[str] = []
+        for chunk in response:
+            collected_chunks.append(chunk)
+            if isinstance(chunk, ChatCompletionChunk):
+                text = ""
+                for choice in chunk.choices:
+                    if choice.delta and getattr(choice.delta, "content", None):
+                        text += choice.delta.content
+                texts.append(text)
+            elif isinstance(chunk, dict):
+                text = chunk.get("output") or chunk.get("content")
+                if isinstance(text, str):
+                    texts.append(text)
+            elif isinstance(chunk, str):
+                texts.append(chunk)
+            else:
+                texts.append(str(chunk))
+        return "".join(texts), collected_chunks
+
+    def _normalise_message(self, message: Dict[str, Any]) -> Dict[str, Any]:
+        normalised = {
+            "role": message.get("role", "assistant"),
+            "content": message.get("content", ""),
+        }
+        if message.get("name"):
+            normalised["name"] = message["name"]
+        if message.get("metadata"):
+            normalised["metadata"] = message["metadata"]
+        return normalised
 
 
 if __name__ == "__main__":

@@ -505,54 +505,80 @@ agent = LightAgent(
 ```
 After enabling ToT, the adaptive tool mechanism is enabled by default. If you need to disable it, please add the parameter filter_tools=False when initializing LightAgent.
 
-### 5. Multi-Agent Collaboration
-Supports swarm-like multi-agent collaboration, enhancing task processing efficiency. Multiple agents can work together to complete complex tasks.
+### 5. Multi-Agent Collaboration & Orchestration
+`LightSwarm` now includes a session manager that maintains shared dialogue history, round limits, and routing strategies (round-robin, role-based, confidence-based, or fully custom callables). Sessions expose `shared_state`, allowing agents to exchange structured memory during collaboration and making it easy to plug in external schedulers or evaluators.
 
 ```python
 from LightAgent import LightAgent, LightSwarm
-# Set Environment Variables OPENAI_API_KEY and OPENAI_BASE_URL
-# The default model uses gpt-4o-mini
 
-# Create an instance of LightSwarm
-light_swarm = LightSwarm()
+swarm = LightSwarm()
 
-# Create multiple agents
-agent_a = LightAgent(
-    name="Agent A",
-    instructions="I am Agent A, the front desk receptionist.",
-    role="Receptionist responsible for welcoming visitors and providing basic information guidance. Before each reply, please state your identity and that you can only guide users to other roles, not directly answer business questions. If you cannot help the user, please respond: Sorry, I am currently unable to assist!"
+planner = LightAgent(name="Planner", role="planner", instructions="Plan the solution.", model="gpt-4o-mini")
+engineer = LightAgent(name="Engineer", role="executor", instructions="Write implementation details.", model="gpt-4o-mini")
+reviewer = LightAgent(name="Reviewer", role="reviewer", instructions="Review outputs and decide FINAL_ANSWER.", model="gpt-4o-mini")
+
+swarm.register_agent(planner, engineer, reviewer)
+
+def finish_when_final_answer(session_state, _):
+    latest = session_state.history[-1] if session_state.history else None
+    content = latest.get("content") if latest else None
+    return isinstance(content, str) and "FINAL_ANSWER" in content
+
+session = swarm.create_session(
+    participants=[planner, engineer, reviewer],
+    routing_strategy="role",
+    routing_rules={
+        "role_transitions": {
+            "planner": "Engineer",
+            "executor": "Reviewer",
+            "reviewer": "Planner",
+        },
+        "fallback": "Planner",
+    },
+    shared_state={"task": "Design a FastAPI service", "notes": []},
+    termination_condition=finish_when_final_answer,
+    auto_stop_tokens=["FINAL_ANSWER"],
 )
 
-agent_b = LightAgent(
-    name="Agent B",
-    instructions="I am Agent B, responsible for the reservation of meeting rooms.",
-    role="Meeting room reservation administrator in charge of handling reservations, cancellations, and inquiries for meeting rooms 1, 2, and 3."
+session = swarm.run_group_chat(
+    session=session,
+    initial_prompt="User: help me plan a FastAPI service with /health and /recommend.",
+    user_name="User",
 )
 
-agent_c = LightAgent(
-    name="Agent C",
-    instructions="I am Agent C, a technical support specialist, responsible for handling technical issues. Please state your identity before each reply, offering detailed responses to technical inquiries, and guide users to contact higher-level technical support for issues beyond your capability."
-)
+for message in session.history:
+    speaker = message.get("name", message.get("role"))
+    print(f"[{speaker}] {message.get('content')}")
 
-agent_d = LightAgent(
-    name="Agent D",
-    instructions="I am Agent D, an HR specialist, responsible for handling HR-related questions.",
-    role="HR specialist managing inquiries and processes related to employee onboarding, offboarding, leave, and benefits."
-)
-
-# Automatically register agents to the LightSwarm instance
-light_swarm.register_agent(agent_a, agent_b, agent_c, agent_d)
-
-# Run Agent A
-res = light_swarm.run(agent=agent_a, query="Hello, I am Alice. I need to check if Wang Xiaoming has completed onboarding.", stream=False)
-print(res)
+# Manual overrides for external schedulers or evaluators
+swarm.update_shared_state(session.session_id, stop=True)  # downstream controller stops the loop
+swarm.run_group_chat(session=session)
 ```
-Output as follows:
+
+The same session object can power task graphs for deterministic pipelines:
+
 ```python
-Hello, I am Agent D, the HR specialist. Regarding whether Wang Xiaoming has completed onboarding, I need to check our system records. Please wait a moment.
-(Checking system records...)
-According to our records, Wang Xiaoming completed his onboarding procedures on January 5, 2025. He has signed all necessary documents and has been assigned an employee number and office location. If you need further details or have any other questions, please feel free to contact the HR department. We are always ready to assist you.
+tasks = [
+    {"id": "plan", "agent": "Planner", "prompt": "List the key steps."},
+    {
+        "id": "implement",
+        "agent": "Engineer",
+        "depends_on": ["plan"],
+        "prompt": lambda results, _: f"Write pseudo code for: {results['plan']}",
+    },
+    {
+        "id": "review",
+        "agent": "Reviewer",
+        "depends_on": ["implement"],
+        "prompt": lambda results, _: f"Review and conclude with FINAL_ANSWER=OK.\n{results['implement']}",
+    },
+]
+
+graph_outputs = swarm.run_task_graph(tasks, session=session)
 ```
+
+External orchestration frameworks can monitor `session.history`, `session.shared_state`, or `graph_outputs` to trigger evaluations, scoring, or escalation policies.
+See [`example/04.multi_agent.py`](example/04.multi_agent.py) for a complete runnable scenario demonstrating shared memory, routing rules, and manual/automatic termination.
 
 ### 6. Streaming API 
 Supports OpenAI streaming format API service output, seamlessly integrating with mainstream chat frameworks.
