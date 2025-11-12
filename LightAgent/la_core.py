@@ -721,6 +721,72 @@ class LightAgent:
         response = self.client.chat.completions.create(**self.chat_params)
         return self._core_run_logic(response, stream, max_retry)
 
+    async def arun(
+            self,
+            query: str,
+            light_swarm=None,
+            stream: bool = False,
+            max_retry: int = 10,
+            user_id: str = "default_user",
+            history: Optional[list] = None,
+            metadata: Optional[Dict] = None,
+    ) -> Union[AsyncGenerator[Any, None], str]:
+        """异步运行代理，兼容新的协程流程。"""
+        traceid = uuid4().hex
+        if self.debug and hasattr(self, 'logger'):
+            self.logger.set_traceid(traceid)
+        self.log("INFO", "arun_start", {"query": query, "user_id": user_id, "stream": stream})
+
+        history = history or []
+
+        if light_swarm:
+            transfer_result = await self._handle_task_transfer_async(query, light_swarm, stream)
+            if transfer_result is not None:
+                return transfer_result
+
+        now = datetime.now()
+        current_date = now.strftime("%Y-%m-%d")
+        current_time = now.strftime("%H:%M:%S")
+        system_prompt = (
+            f"##代理名称：{self.name}\n"
+            f"##代理指令：{self.instructions}\n"
+            f"##身份：{self.role}\n"
+            f"请一步一步思考来完成用户的要求。尽可能完成用户的回答，如果有补充信息，请参考补充信息来调用工具，直到获取所有满足用户的提问所需的答案。\n"
+            f"今日的日期: {current_date} 当前时间: {current_time}"
+        )
+        query = self._add_memory_context(query, user_id)
+
+        active_tools = []
+        if self.tree_of_thought:
+            tot_response, active_tools = self.run_thought(query)
+            system_prompt += f"\n##以下是问题的补充说明\n{tot_response}"
+            self.log("DEBUG", "tree_of_thought", {"response": tot_response, "active_tools": active_tools})
+
+        self.chat_params = {
+            "model": self.model,
+            "messages": [{"role": "system", "content": system_prompt}] + history + [
+                {"role": "user", "content": query}],
+            "stream": stream
+        }
+
+        if metadata:
+            for key, value in metadata.items():
+                self.chat_params[key] = value
+
+        tools = active_tools or self.tool_registry.get_tools()
+        if tools:
+            self.chat_params["tools"] = tools
+            self.chat_params["tool_choice"] = "auto"
+
+        if hasattr(self, 'tracetools') and self.tracetools:
+            self.chat_params["session_id"] = traceid
+
+        self.log("DEBUG", "async_first_request_params", {"params": self.chat_params})
+        response = await asyncio.to_thread(self.client.chat.completions.create, **self.chat_params)
+        if stream:
+            return self._run_stream_logic(response, max_retry)
+        return await self._run_non_stream_logic(response, max_retry)
+
     def _add_memory_context(self, query: str, user_id: str) -> str:
         """添加记忆上下文"""
         if not self.memory:
@@ -745,93 +811,132 @@ class LightAgent:
         return f"{context}\n##用户提问：\n{query}" if context else query
 
     def _core_run_logic(self, response, stream, max_retry) -> Union[Generator[str, None, None], str]:
-        """核心运行逻辑"""
+        """核心运行逻辑（同步包装）"""
+        if stream:
+            async_gen = self._run_stream_logic(response, max_retry)
+            return self._wrap_async_stream(async_gen)
+        return asyncio.run(self._run_non_stream_logic(response, max_retry))
+
+    async def _core_run_logic_async(self, response, stream, max_retry) -> Union[AsyncGenerator[Any, None], str]:
+        """核心运行逻辑（异步模式）。"""
         if stream:
             return self._run_stream_logic(response, max_retry)
-        else:
-            return self._run_non_stream_logic(response, max_retry)
+        return await self._run_non_stream_logic(response, max_retry)
 
-    def _run_non_stream_logic(self, response, max_retry) -> Union[str, None]:
-        """
-        非流式处理逻辑。
-        """
+    def _wrap_async_stream(self, async_gen: AsyncGenerator) -> Generator:
+        """将异步生成器包装为同步生成器，兼容历史同步接口。"""
+
+        def generator():
+            try:
+                running_loop = asyncio.get_running_loop()
+                if running_loop.is_running():
+                    raise RuntimeError(
+                        "LightAgent.run(stream=True) cannot be used inside an active event loop. "
+                        "Please use await agent.arun(..., stream=True) instead."
+                    )
+            except RuntimeError:
+                pass
+
+            loop = asyncio.new_event_loop()
+            previous_loop = None
+            try:
+                try:
+                    previous_loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    previous_loop = None
+
+                asyncio.set_event_loop(loop)
+                ait = async_gen.__aiter__()
+                while True:
+                    try:
+                        item = loop.run_until_complete(ait.__anext__())
+                    except StopAsyncIteration:
+                        break
+                    else:
+                        yield item
+            finally:
+                try:
+                    loop.run_until_complete(async_gen.aclose())
+                except Exception:
+                    pass
+                loop.close()
+                if previous_loop is not None:
+                    asyncio.set_event_loop(previous_loop)
+                else:
+                    asyncio.get_event_loop_policy().set_event_loop(None)
+
+        return generator()
+
+    def _format_tool_chunk(self, tool_name: str, chunk: Any) -> str:
+        """将工具返回的单个片段格式化为字符串。"""
+        if isinstance(chunk, ChatCompletionChunk):
+            if chunk.choices and chunk.choices[0].delta:
+                delta = chunk.choices[0].delta
+                if tool_name == "finish":
+                    return (delta.content or "") if hasattr(delta, "content") else ""
+                if hasattr(delta, "content") and delta.content:
+                    return delta.content
+            if hasattr(chunk, "model_dump_json"):
+                return chunk.model_dump_json()
+            return str(chunk)
+        if isinstance(chunk, (dict, list)):
+            try:
+                return json.dumps(chunk, ensure_ascii=False)
+            except TypeError:
+                return str(chunk)
+        return str(chunk)
+
+    async def _gather_tool_response(self, tool_name: str, tool_response: Any) -> str:
+        """聚合工具响应为字符串，兼容异步/同步生成器。"""
+        fragments: List[str] = []
+        if inspect.isasyncgen(tool_response):
+            async for chunk in tool_response:
+                fragments.append(self._format_tool_chunk(tool_name, chunk))
+        elif inspect.isgenerator(tool_response):
+            for chunk in tool_response:
+                fragments.append(self._format_tool_chunk(tool_name, chunk))
+        else:
+            fragments.append(self._format_tool_chunk(tool_name, tool_response))
+
+        combined_response = "".join(fragments)
+        if not combined_response:
+            return combined_response
+
+        try:
+            parsed = json.loads(combined_response)
+            combined_response = json.dumps(parsed, ensure_ascii=False)
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return combined_response
+
+    async def _run_non_stream_logic(self, response, max_retry) -> Union[str, None]:
+        """非流式处理逻辑。"""
         for _ in range(max_retry):
             if response.choices[0].message.tool_calls:
-                # 初始化一个列表，用于存储所有工具调用的结果
                 tool_responses = []
-                # 初始化变量
-                output = ""
                 function_call_name = ""
                 tool_calls = response.choices[0].message.tool_calls
                 self.log("DEBUG", "non_stream tool_calls", {"tool_calls": tool_calls})
 
-                # 遍历所有工具调用
                 for tool_call in tool_calls:
                     function_call = tool_call.function
-
-                    # 尝试自动修复常见转义问题
                     fixed_args = function_call.arguments.replace('\\"', '"').replace('\\\\', '\\')
                     self.log("DEBUG", "non_stream function_call", {"function_call": fixed_args})
 
-                    # 解析函数参数
                     function_args = json.loads(fixed_args)
-
-                    # 调用工具并获取响应
-                    tool_response = asyncio.run(self.tool_dispatcher.dispatch(function_call.name, function_args))
+                    tool_response = await self.tool_dispatcher.dispatch(function_call.name, function_args)
                     function_call_name = function_call.name
-                    combined_response = ""
-                    single_tool_response = ""
 
-                    # 如果工具返回的是生成器（流式输出），则将所有 chunk 叠加
-                    if isinstance(tool_response, Generator):
-                        # print(f"Streaming response from tool: {function_call.name}")
-                        for chunk in tool_response:
-                            # print("Received chunk:", chunk)  # 打印每个 chunk
-                            if function_call_name == 'finish':
-                                content = chunk.choices[0].delta.content or ""
-                                combined_response += content  # 将每个 chunk 叠加
-                            else:
-                                combined_response += chunk  # 将每个 chunk 叠加
-                        if combined_response == "":
-                            combined_response = "".join(tool_response)
-
-                        # 将 combined_response 解析为 JSON 对象（如果它是 JSON 字符串）
-                        try:
-                            combined_response = json.loads(combined_response)  # 解析 JSON
-                        except json.JSONDecodeError:
-                            pass  # 如果不是 JSON 字符串，保持原样
-
-                        # 将 JSON 对象中的 Unicode 编码转换为中文字符
-                        if isinstance(combined_response, dict):
-                            combined_response = json.dumps(combined_response, ensure_ascii=False)  # 确保中文字符不转义
-                        single_tool_response = combined_response  # 处理单个工具的方法
-
-                    else:
-                        # print(f"Non-streaming response from tool: {function_call.name}")
-                        combined_response = tool_response
-                        # print("tool_response type:",type(combined_response))
-                        # 如果是 JSON 字符串，解析并转换为中文
-                        if isinstance(combined_response, str):
-                            try:
-                                combined_response = json.loads(combined_response)  # 解析 JSON
-                                combined_response = json.dumps(combined_response, ensure_ascii=False)  # 转换为中文
-                            except json.JSONDecodeError:
-                                combined_response = tool_response
-                                pass  # 如果不是 JSON 字符串，保持原样
-                        single_tool_response = combined_response  # 处理单个工具的方法
+                    combined_response = await self._gather_tool_response(function_call_name, tool_response)
+                    single_tool_response = combined_response if combined_response is not None else ""
 
                     self.log("INFO", "non_stream single_tool_response",
                              {"single_tool_response": single_tool_response})
-
-                    # 将单个工具的响应结果添加到列表中
                     tool_responses.append(single_tool_response)
 
-                # 将所有工具调用的结果合并为一个字符串
                 self.log("DEBUG", "non_stream tool_responses", {"tool_responses": tool_responses})
 
                 combined_tool_response = "\n".join(tool_responses)
-
-                # 将工具调用和响应添加到消息列表中
                 self.chat_params["messages"].append(
                     {
                         "role": "assistant",
@@ -845,15 +950,13 @@ class LightAgent:
                     }
                 )
             else:
-                # 返回最终回复
                 reply = response.choices[0].message.content
                 self.log("INFO", "non_stream final_reply", {"reply": reply})
                 return reply
 
-            # 更新响应
             if function_call_name == 'finish':
-                return  # 如果最后调用了finish工具，则结束生成器
-            # print("params:",self.chat_params)
+                return None
+
             self.log("DEBUG", "non_stream chat-completions params", {"params": self.chat_params})
 
             try:
@@ -861,25 +964,21 @@ class LightAgent:
             except Exception as e:
                 print(f"An error occurred: {e}")
 
-        # 重试次数用尽
         self.log("ERROR", "max_retry_reached", {"message": "Failed to generate a valid response."})
         return "Failed to generate a valid response."
 
-    def _run_stream_logic(self, response, max_retry) -> Generator[str, None, None]:
-        """流式处理逻辑"""
+    async def _run_stream_logic(self, response, max_retry) -> AsyncGenerator[Any, None]:
+        """流式处理逻辑，支持异步工具调度。"""
         for _ in range(max_retry):
-            # 初始化变量
             output = ""
-            tool_calls = []  # 用于存储所有工具调用的信息
-            tool_responses = []  # 用于存储所有工具调用的结果
-            finish_called = False  # 标记是否调用了finish工具
+            tool_calls = []
+            tool_responses = []
+            finish_called = False
             reasoning_content = ""
             content = ""
 
             for chunk in response:
-
-                if chunk.choices and len(chunk.choices) > 0:
-                    choice = chunk.choices[0]
+                choice = chunk.choices[0] if chunk.choices else None
 
                 if choice and hasattr(choice.delta, "reasoning_content") and choice.delta.reasoning_content is not None:
                     reasoning_content = choice.delta.reasoning_content or ""
@@ -893,26 +992,19 @@ class LightAgent:
                 if content:
                     output += content
 
-                yield chunk  # 流式返回内容
+                yield chunk
 
                 try:
-                    # 检查是否有工具调用
                     if chunk.choices and chunk.choices[0].delta.tool_calls:
                         tool_call_delta = chunk.choices[0].delta.tool_calls[0]
+                        tool_call_index = tool_call_delta.index if hasattr(tool_call_delta, "index") and tool_call_delta.index is not None else 0
 
-                        # 获取工具调用的索引，确保它是有效的整数
-                        tool_call_index = tool_call_delta.index if hasattr(tool_call_delta,
-                                                                           "index") and tool_call_delta.index is not None else 0
-
-                        # 如果工具调用信息尚未记录，初始化一个空字典
                         if len(tool_calls) <= tool_call_index:
                             tool_calls.append({"name": "", "arguments": "", "index": tool_call_index, "title": ""})
 
-                        # 更新工具调用的名称
                         if hasattr(tool_call_delta.function, "name") and tool_call_delta.function.name:
                             tool_calls[tool_call_index]["name"] = tool_call_delta.function.name
 
-                        # 更新工具调用的参数
                         if hasattr(tool_call_delta.function, "arguments") and tool_call_delta.function.arguments:
                             tool_calls[tool_call_index]["arguments"] += tool_call_delta.function.arguments
 
@@ -922,138 +1014,112 @@ class LightAgent:
                         "traceback": traceback.format_exc()
                     })
 
-                # 如果流式输出结束
                 finish_reason = chunk.choices[0].finish_reason if chunk.choices else None
                 if finish_reason == "stop" and not any(tc["name"] for tc in tool_calls):
                     self.log("INFO", "stream_response", {"output": output})
-                    return  # 结束生成器
+                    return
 
-                # 如果工具调用结束
-                elif finish_reason in ("tool_calls", "stop") and any(tc["name"] for tc in tool_calls):
-                    # 遍历所有工具调用
+                if finish_reason in ("tool_calls", "stop") and any(tc["name"] for tc in tool_calls):
                     self.log("DEBUG", "stream tool_calls", {"tool_calls": tool_calls})
                     for tool_call in tool_calls:
-                        if tool_call["name"]:  # 确保工具调用有名称
-                            tool_name = tool_call["name"]
-                            arguments = tool_call["arguments"]
+                        if not tool_call["name"]:
+                            continue
 
-                            # 从注册表中获取工具标题
-                            tool_info = self.tool_registry.function_info.get(tool_name, {})
-                            tool_title = tool_info.get("tool_title") or ""
+                        tool_name = tool_call["name"]
+                        arguments = tool_call["arguments"]
+                        tool_info = self.tool_registry.function_info.get(tool_name, {})
+                        tool_title = tool_info.get("tool_title") or ""
+                        tool_call["title"] = tool_title
 
-                            # 更新工具调用信息
-                            tool_call["title"] = tool_title
+                        tool_call_info = {
+                            "name": tool_name,
+                            "title": tool_title,
+                            "arguments": arguments,
+                        }
+                        self.log("INFO", "stream function_call", {"tool_call_start": tool_call_info})
+                        yield tool_call_info
 
-                            # 记录调用工具
-                            tool_call_info = {
-                                "name": tool_name,
+                        try:
+                            json_objects = re.findall(r'\{.*?\}', tool_call_info["arguments"])
+
+                            for json_obj in json_objects:
+                                fixed_args = json_obj.replace('\\"', '"').replace('\\\\', '\\')
+                                self.log("DEBUG", "stream fixed_args", {"fixed_args": fixed_args})
+                                function_args = json.loads(fixed_args)
+
+                                tool_response = await self.tool_dispatcher.dispatch(tool_name, function_args)
+
+                                combined_response = ""
+                                if inspect.isasyncgen(tool_response):
+                                    async for tool_chunk in tool_response:
+                                        formatted_chunk = self._format_tool_chunk(tool_name, tool_chunk)
+                                        combined_response += formatted_chunk
+                                        if isinstance(tool_chunk, ChatCompletionChunk):
+                                            yield tool_chunk
+                                        else:
+                                            tool_output = {
+                                                "name": tool_name,
+                                                "title": tool_title,
+                                                "output": tool_chunk,
+                                            }
+                                            self.log("DEBUG", "stream tool_output", {"tool_output": tool_output})
+                                            yield tool_output
+                                elif inspect.isgenerator(tool_response):
+                                    for tool_chunk in tool_response:
+                                        formatted_chunk = self._format_tool_chunk(tool_name, tool_chunk)
+                                        combined_response += formatted_chunk
+                                        if isinstance(tool_chunk, ChatCompletionChunk):
+                                            yield tool_chunk
+                                        else:
+                                            tool_output = {
+                                                "name": tool_name,
+                                                "title": tool_title,
+                                                "output": tool_chunk,
+                                            }
+                                            self.log("DEBUG", "stream tool_output", {"tool_output": tool_output})
+                                            yield tool_output
+                                else:
+                                    combined_response = self._format_tool_chunk(tool_name, tool_response)
+                                    tool_output = {
+                                        "name": tool_name,
+                                        "title": tool_title,
+                                        "output": combined_response,
+                                    }
+                                    yield tool_output
+
+                                self.log("INFO", "stream single_tool_response",
+                                         {"single_tool_response": combined_response})
+                                tool_responses.append(combined_response)
+
+                                if tool_name == 'finish':
+                                    finish_called = True
+                                    self.log("INFO", "finish_tool_called", {"response": combined_response})
+
+                        except json.JSONDecodeError as e:
+                            error_msg = f"JSON解析错误: {str(e)}\n参数: {arguments}"
+                            self.log("ERROR", "json_decode_error",
+                                     {"tool": tool_name, "title": tool_title, "error": error_msg})
+                            tool_responses.append(error_msg)
+                            yield {"name": tool_name, "title": tool_title, "error": error_msg}
+
+                        except Exception as e:
+                            error_msg = f"工具调用错误: {str(e)}\n{traceback.format_exc()}"
+                            self.log("ERROR", "tool_execution_error", {
+                                "tool": tool_name,
                                 "title": tool_title,
-                                "arguments": arguments,
-                            }
-                            self.log("INFO", "stream function_call", {"tool_call_start": tool_call_info})
-                            # 将工具的调用信息推送给开发者
-                            yield tool_call_info
+                                "error": error_msg
+                            })
+                            tool_responses.append(error_msg)
+                            yield {"name": tool_name, "title": tool_title, "error": error_msg}
 
-                            # 解析参数并调用工具
-                            try:
-                                # 使用正则表达式将多个 JSON 对象拆分开
-                                json_objects = re.findall(r'\{.*?\}', tool_call_info["arguments"])
-
-                                # 解析每个 JSON 对象并调用工具
-                                # for json_obj in json_objects:
-                                #     function_args = json.loads(json_obj)
-                                #     tool_response = dispatch_tool(function_call["name"], function_args)
-                                #     tool_responses.append(tool_response)
-
-                                for json_obj in json_objects:
-                                    # 尝试自动修复常见转义问题
-                                    fixed_args = json_obj.replace('\\"', '"').replace('\\\\', '\\')
-                                    self.log("DEBUG", "stream fixed_args", {"fixed_args": fixed_args})
-
-                                    # 解析参数
-                                    function_args = json.loads(fixed_args)
-
-                                    # 调用工具
-                                    tool_response = asyncio.run(self.tool_dispatcher.dispatch(tool_name, function_args))
-
-                                    # 处理不同类型的工具响应
-                                    combined_response = ""
-                                    single_tool_response = ""
-
-                                    # 如果工具返回的是生成器（流式输出），则将所有 chunk 叠加
-                                    if isinstance(tool_response, Generator):
-                                        # print(f"Streaming response from tool: {function_call['name']}")
-                                        for chunk in tool_response:
-                                            # 将工具返回的数据继续流出
-                                            if isinstance(chunk, ChatCompletionChunk):
-                                                yield chunk
-                                            else:
-                                                tool_output = {
-                                                    "name": tool_name,
-                                                    "title": tool_title,
-                                                    "output": chunk,
-                                                }
-                                                self.log("DEBUG", "stream tool_output",
-                                                         {"tool_output": tool_output})
-                                                yield tool_output
-                                            # 将工具的调用信息推送给开发者
-                                            if tool_name == 'finish':
-                                                content = chunk.choices[0].delta.content or ""
-                                                combined_response += content  # 将每个 chunk 叠加
-                                            else:
-                                                combined_response += chunk  # 将每个 chunk 叠加
-                                        single_tool_response = combined_response  # 处理单个工具的方法
-                                    else:
-                                        # print(f"Non-streaming response from tool: {tool_response}")
-                                        combined_response = str(tool_response)
-                                        single_tool_response = combined_response  # 处理单个工具的方法
-                                        tool_output = {
-                                            "name": tool_name,
-                                            "title": tool_title,
-                                            "output": combined_response
-                                        }
-                                        yield tool_output
-
-                                    # 记录工具响应
-                                    self.log("INFO", "stream single_tool_response",
-                                             {"single_tool_response": single_tool_response})
-
-                                    # 将单个工具的响应结果保存到列表中
-                                    tool_responses.append(single_tool_response)
-
-                                    # 检查是否调用了finish工具
-                                    if tool_name == 'finish':
-                                        finish_called = True
-                                        self.log("INFO", "finish_tool_called", {"response": combined_response})
-
-                            except json.JSONDecodeError as e:
-                                error_msg = f"JSON解析错误: {str(e)}\n参数: {arguments}"
-                                self.log("ERROR", "json_decode_error",
-                                         {"tool": tool_name, "title": tool_title, "error": error_msg})
-                                tool_responses.append(error_msg)
-                                yield {"name": tool_name, "title": tool_title, "error": error_msg}
-
-                            except Exception as e:
-                                error_msg = f"工具调用错误: {str(e)}\n{traceback.format_exc()}"
-                                self.log("ERROR", "tool_execution_error", {
-                                    "tool": tool_name,
-                                    "title": tool_title,
-                                    "error": error_msg
-                                })
-                                tool_responses.append(error_msg)
-                                yield {"name": tool_name, "title": tool_title, "error": error_msg}
-
-                    # 如果调用了finish工具，则结束处理
                     if finish_called:
                         return
 
-                    # 准备下一轮请求
                     combined_tool_response = "\n".join(tool_responses)
                     tool_str = json.dumps(
                         [{"name": tool_call["name"], "arguments": tool_call["arguments"]} for tool_call in tool_calls],
                         ensure_ascii=False)
 
-                    # 添加工具调用和响应到消息历史
                     self.chat_params["messages"].append(
                         {
                             "role": "assistant",
@@ -1067,14 +1133,59 @@ class LightAgent:
                         }
                     )
 
-                    # 创建新的响应流
                     self.log("DEBUG", "stream next_request_params", {"params": self.chat_params})
                     response = self.client.chat.completions.create(**self.chat_params)
                     break
 
-        # 重试次数用尽
         self.log("ERROR", "max_retry_reached", {"message": "Failed to generate a valid response."})
         yield "Failed to generate a valid response."
+
+    async def _handle_task_transfer_async(
+            self,
+            query: str,
+            light_swarm: 'LightSwarm',
+            stream: bool = False,
+    ) -> Optional[Union[AsyncGenerator[Any, None], str]]:
+        intent = self._detect_intent(query, light_swarm)
+        if intent and intent.get("transfer_to"):
+            target_agent_name = intent["transfer_to"]
+            self.log("INFO", "detect_intent_async", {"intent": intent})
+            if target_agent_name == self.name:
+                self.log("INFO", "self_transfer_detected", {"target_agent": target_agent_name})
+                return None
+            target_agent = light_swarm.agents[target_agent_name]
+            if stream:
+                return await self._handle_task_transfer_stream_async(target_agent, query, light_swarm)
+            return await self._handle_task_transfer_non_stream_async(target_agent, query, light_swarm)
+        return None
+
+    async def _handle_task_transfer_stream_async(
+            self,
+            target_agent: 'LightAgent',
+            context: str,
+            light_swarm: 'LightSwarm',
+    ) -> AsyncGenerator[Any, None]:
+        self.log("INFO", "transfer_to_agent_async", {"from": self.name, "to": target_agent.name, "context": context})
+        if not hasattr(target_agent, 'arun'):
+            raise RuntimeError("Target agent does not support asynchronous execution")
+        return await target_agent.arun(context, light_swarm=light_swarm, stream=True)
+
+    async def _handle_task_transfer_non_stream_async(
+            self,
+            target_agent: 'LightAgent',
+            context: str,
+            light_swarm: 'LightSwarm',
+    ) -> str:
+        self.log("INFO", "transfer_to_agent_async", {"from": self.name, "to": target_agent.name, "context": context})
+        if hasattr(target_agent, 'arun'):
+            result = await target_agent.arun(context, light_swarm=light_swarm, stream=False)
+            if inspect.isasyncgen(result):
+                chunks = []
+                async for chunk in result:
+                    chunks.append(str(chunk))
+                return "".join(chunks)
+            return result
+        return await asyncio.to_thread(target_agent.run, context, light_swarm, False)
 
     def _handle_task_transfer(
             self,
@@ -1478,6 +1589,12 @@ class LightSwarm:
         if agent.name not in self.agents:
             raise ValueError(f"Agent '{agent.name}' not found.")
         return agent.run(query, light_swarm=self, stream=stream)
+
+    async def arun(self, agent: LightAgent, query: str, stream=False):
+        """异步运行指定代理。"""
+        if agent.name not in self.agents:
+            raise ValueError(f"Agent '{agent.name}' not found.")
+        return await agent.arun(query, light_swarm=self, stream=stream)
 
 
 if __name__ == "__main__":

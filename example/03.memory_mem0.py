@@ -1,10 +1,10 @@
-# Enable Memory Module
-
-# Or use a custom memory module, here is an example with mem0 https://github.com/mem0ai/mem0/
-from mem0 import Memory
-from LightAgent import LightAgent
+import asyncio
 import os
+
 from loguru import logger
+from mem0 import Memory
+
+from LightAgent import LightAgent
 
 class CustomMemory:
     def __init__(self):
@@ -38,7 +38,8 @@ class CustomMemory:
         result = self.m.search(query, user_id=user_id)
         return result
 
-agent = LightAgent(
+async def main() -> None:
+    agent = LightAgent(
         role="Please remember that you are LightAgent, a useful assistant to help users use multiple tools.",  # system role description
         model="deepseek-chat",  # Supported models: openai, chatglm, deepseek, qwen, etc.
         api_key="your_api_key",  # Replace with your large model provider API Key
@@ -47,12 +48,16 @@ agent = LightAgent(
         tree_of_thought=False,  # Enable Chain of Thought
     )
 
-# Memory-enabled test & if tools need to be added, you can add tools to the agent for memory-enabled tool calls
+    # Memory-enabled test & if tools need to be added, you can add tools to the agent for memory-enabled tool calls
+    user_id = "user_01"
+    logger.info("\n=========== next conversation ===========")
+    query = "Introduce me to the attractions in Sanya. Many of my friends have traveled to Sanya, and I want to visit too."
+    print(await agent.arun(query, stream=False, user_id=user_id))
+    logger.info("\n=========== next conversation ===========")
+    query = "Where should I travel?"
+    print(await agent.arun(query, stream=False, user_id=user_id))
 
-user_id = "user_01"
-logger.info("\n=========== next conversation ===========")
-query = "Introduce me to the attractions in Sanya. Many of my friends have traveled to Sanya, and I want to visit too."
-print(agent.run(query, stream=False, user_id=user_id))
-logger.info("\n=========== next conversation ===========")
-query = "Where should I travel?"
-print(agent.run(query, stream=False, user_id=user_id))
+
+if __name__ == "__main__":
+    # 使用 asyncio.run 在同步环境中驱动异步示例。
+    asyncio.run(main())
