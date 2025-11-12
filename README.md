@@ -185,6 +185,18 @@ Supports an unlimited number of customizable tools.
 
 Multiple tool examples: tools = [search_news, get_weather, get_stock_realtime_data, get_stock_kline_data]
 
+### Reuse Loaded Tools
+
+You can retrieve any successfully registered tool function directly from the agent—mirroring LangChain's `tool_retriever` usage—so that it can be reused elsewhere in your application.
+
+```python
+# Reuse the tool without redefining it
+weather_tool = agent.get_tool("get_weather")
+print(weather_tool(city_name="Beijing"))
+```
+
+This works for tools that are loaded from the default `tools/` directory via `ToolLoader` as well as those passed in as callables during initialization.
+
 ---
 
 ## Function Details
